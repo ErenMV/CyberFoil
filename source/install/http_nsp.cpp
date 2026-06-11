@@ -133,7 +133,7 @@ namespace tin::install::nsp
                 return !stopThreadsHttpNsp && args->retryConfirm.approved.load();
             };
 
-            if (args->download->StreamDataRange(args->pfs0Offset, args->ncaSize, streamFunc, retryConfirmFunc) == 1)
+            if (args->download->StreamDataRange(args->pfs0Offset, args->ncaSize, streamFunc, retryConfirmFunc) != 0)
                 stopThreadsHttpNsp = true;
         }
         catch (...) {

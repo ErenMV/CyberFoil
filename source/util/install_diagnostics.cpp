@@ -158,6 +158,27 @@ namespace inst::diag {
             return failure;
         }
 
+        if (ContainsAny(lower, {
+                "http range read failed",
+                "range request",
+                "http status",
+                "ignored the range request",
+                "curl error",
+                "curl=",
+                "timeout was reached",
+                "couldn't connect",
+                "could not resolve",
+                "failed to retrieve http header",
+                "transferred a partial file",
+                "connection reset",
+                "ssl connect error"
+            })) {
+            failure.category = "Network/HTTP error";
+            failure.summary = "[ERROR] Network error while downloading from the remote server.";
+            failure.recommendation = "Check Wi-Fi stability (2.4 GHz often works better), confirm the server is reachable, and verify it supports HTTP range requests (responds 206).";
+            return failure;
+        }
+
         if (ContainsAny(lower, {"failed to register", "failed to set content records", "commit content records", "failed to read file", "failed to write", "storage", "sd", "i/o", "no space", "filesystem"})) {
             failure.category = "Storage write failure";
             failure.summary = "[ERROR] Failed to write content to target storage.";

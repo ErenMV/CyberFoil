@@ -173,7 +173,27 @@ namespace tin::network
     {
         std::function<size_t (u8* bytes, size_t size)>* streamFunc = nullptr;
         bool hadException = false;
+        long statusCode = 0;
+        bool blockedWrongStatus = false;
     };
+
+    static size_t RangeStatusHeaderCallback(char* bytes, size_t size, size_t numItems, void* userData)
+    {
+        auto* ctx = reinterpret_cast<StreamCallbackContext*>(userData);
+        const size_t numBytes = size * numItems;
+        if (!ctx)
+            return numBytes;
+
+        // Track the status line of the latest response (redirects update it).
+        const std::string line(bytes, numBytes);
+        if (line.rfind("HTTP/", 0) == 0)
+        {
+            const size_t space = line.find(' ');
+            if (space != std::string::npos)
+                ctx->statusCode = std::strtol(line.c_str() + space + 1, nullptr, 10);
+        }
+        return numBytes;
+    }
 
     static size_t ParseHTMLDataCallback(char* bytes, size_t size, size_t numItems, void* userData)
     {
@@ -183,6 +203,15 @@ namespace tin::network
 
         if (inst::ui::instPage::isInstallCancelRequested())
             return 0;
+
+        // A range request must answer 206. Anything else (200 full-body, 4xx/5xx
+        // error pages) would corrupt the destination buffer if forwarded — abort
+        // the transfer without consuming the body.
+        if (ctx->statusCode != 0 && ctx->statusCode != 206)
+        {
+            ctx->blockedWrongStatus = true;
+            return 0;
+        }
 
         const size_t numBytes = size * numItems;
         try {
@@ -223,6 +252,16 @@ namespace tin::network
         curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 8L);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &callbackCtx);
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &ParseHTMLDataCallback);
+        curl_easy_setopt(curl, CURLOPT_HEADERDATA, &callbackCtx);
+        curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, &RangeStatusHeaderCallback);
+        // Robustness on flaky Wi-Fi: bound connection setup, abort stalled
+        // transfers instead of hanging forever, and keep the TCP path alive.
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
+        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);
+        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 30L);
+        curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+        curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 30L);
+        curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 15L);
         std::string authValue;
         ApplyBasicAuth(curl, authValue);
 
@@ -263,13 +302,42 @@ namespace tin::network
         if (rc == CURLE_OK && httpCode == 206)
             return 0;
 
-        LOG_DEBUG("Range request failed url=%s range=%s http=%lu curl=%d\n",
-            requestUrl.c_str(), range.c_str(), httpCode, (int)rc);
+        LOG_DEBUG("Range request failed url=%s range=%s http=%lu curl=%d wrongStatus=%d\n",
+            requestUrl.c_str(), range.c_str(), httpCode, (int)rc, (int)callbackCtx.blockedWrongStatus);
+
+        // Prefer the header-callback status: when the body was blocked because the
+        // server didn't answer 206, curl reports CURLE_WRITE_ERROR but the real
+        // cause is the HTTP status.
+        if (callbackCtx.blockedWrongStatus && callbackCtx.statusCode != 0)
+            return static_cast<int>(callbackCtx.statusCode);
 
         if (httpCode != 0 && httpCode != 206)
             return static_cast<int>(httpCode);
 
         return 1000 + static_cast<int>(rc);
+    }
+
+    // Translates StreamDataRange/StreamHttpRangeForUrl return codes into a
+    // human-readable cause so install logs stop showing an opaque "rc=1".
+    static std::string DescribeRangeError(int rc, size_t sizeRead, size_t sizeExpected)
+    {
+        std::stringstream ss;
+        if (rc == 1999)
+            ss << "write callback exception";
+        else if (rc == 200)
+            ss << "HTTP 200: server ignored the Range request (no partial content support)";
+        else if (rc >= 100 && rc < 600)
+            ss << "HTTP status " << rc;
+        else if (rc >= 1000 && rc < 1999)
+            ss << "curl error " << (rc - 1000) << ": " << curl_easy_strerror(static_cast<CURLcode>(rc - 1000));
+        else if (rc == 0 && sizeRead != sizeExpected)
+            ss << "short read";
+        else
+            ss << "rc=" << rc;
+
+        if (sizeRead != sizeExpected)
+            ss << ", got " << sizeRead << "/" << sizeExpected << " bytes";
+        return ss.str();
     }
 
     HTTPHeader::HTTPHeader(std::string url) :
@@ -459,7 +527,7 @@ namespace tin::network
         const int rc = this->StreamDataRange(offset, size, streamFunc);
         if (rc != 0 || sizeRead != size)
         {
-            THROW_FORMAT("HTTP range read failed (rc=%d)\n", rc);
+            THROW_FORMAT("HTTP range read failed (%s)\n", DescribeRangeError(rc, sizeRead, size).c_str());
         }
     }
 
@@ -477,6 +545,7 @@ namespace tin::network
         auto streamWithRetry = [&](const std::string& url, size_t requestOffset, size_t requestSize) -> int
         {
             size_t bytesReceived = 0;
+            int lastRc = 1;
 
             auto trackingFunc = [&](u8* buf, size_t sz) -> size_t {
                 size_t written = streamFunc(buf, sz);
@@ -505,19 +574,21 @@ namespace tin::network
                     if (rc == 0)
                         return 0;
 
+                    lastRc = rc;
+
+                    // 200 = server ignored the Range header; 4xx/416 = request will
+                    // never succeed. Retrying those only delays the same failure.
                     const bool fatal =
                         rc == 1999 ||
-                        rc == 401 ||
-                        rc == 403 ||
-                        rc == 404 ||
-                        rc == 416 ||
+                        rc == 200 ||
+                        (rc >= 400 && rc < 500) ||
                         rc == 1000 + CURLE_WRITE_ERROR;
 
                     if (fatal)
                     {
                         LOG_DEBUG("StreamDataRange: fatal error, aborting (url=%s rc=%d)\n",
                             url.c_str(), rc);
-                        return 1;
+                        return rc;
                     }
 
                     LOG_DEBUG("StreamDataRange: retriable error (url=%s rc=%d), %d retries left\n",
@@ -533,7 +604,7 @@ namespace tin::network
                 break;
             }
 
-            return 1;
+            return lastRc;
         };
 
         if (!m_isJbod)
