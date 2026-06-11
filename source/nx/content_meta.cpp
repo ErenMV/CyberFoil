@@ -23,7 +23,6 @@ SOFTWARE.
 #include "nx/content_meta.hpp"
 
 #include <string.h>
-#include "util/title_util.hpp"
 #include "util/debug.h"
 #include "util/error.hpp"
 
@@ -63,7 +62,7 @@ namespace nx::ncm
     }
 
     // TODO: Cache this
-    std::vector<NcmContentInfo> ContentMeta::GetContentInfos()
+    std::vector<NcmContentInfo> ContentMeta::GetContentInfos(bool includeDeltaFragments)
     {
         PackagedContentMetaHeader contentMetaHeader = this->GetPackagedContentMetaHeader();
 
@@ -74,8 +73,9 @@ namespace nx::ncm
         {
             PackagedContentInfo packagedContentInfo = packagedContentInfos[i];
 
-            // Don't install delta fragments. Even patches don't seem to install them.
-            if (static_cast<u8>(packagedContentInfo.content_info.content_type) <= 5)
+            // Delta fragments should not be scheduled as standalone installs, but patch
+            // metadata still needs to preserve their content records verbatim.
+            if (includeDeltaFragments || static_cast<u8>(packagedContentInfo.content_info.content_type) <= NcmContentType_LegalInformation)
             {
                 contentInfos.push_back(packagedContentInfo.content_info); 
             }
@@ -87,7 +87,11 @@ namespace nx::ncm
     void ContentMeta::GetInstallContentMeta(tin::data::ByteBuffer& installContentMetaBuffer, NcmContentInfo& cnmtNcmContentInfo, bool ignoreReqFirmVersion)
     {
         PackagedContentMetaHeader packagedContentMetaHeader = this->GetPackagedContentMetaHeader();
-        std::vector<NcmContentInfo> contentInfos = this->GetContentInfos();
+        std::vector<NcmContentInfo> contentInfos = this->GetContentInfos(true);
+        const size_t packagedContentInfosOffset = sizeof(PackagedContentMetaHeader) + packagedContentMetaHeader.extended_header_size;
+        const size_t packagedContentInfosSize = sizeof(PackagedContentInfo) * packagedContentMetaHeader.content_count;
+        const size_t packagedTailOffset = packagedContentInfosOffset + packagedContentInfosSize;
+        const size_t packagedTailSize = (m_bytes.GetSize() > packagedTailOffset) ? (m_bytes.GetSize() - packagedTailOffset) : 0;
 
         // Setup the content meta header
         NcmContentMetaHeader contentMetaHeader;
@@ -122,11 +126,11 @@ namespace nx::ncm
             installContentMetaBuffer.Append<NcmContentInfo>(contentInfo);
         }
 
-        if (packagedContentMetaHeader.type == NcmContentMetaType_Patch)
+        if (packagedTailSize > 0)
         {
-            NcmPatchMetaExtendedHeader* patchMetaExtendedHeader = (NcmPatchMetaExtendedHeader*)extendedHeaderSourceBytes;
-            installContentMetaBuffer.Resize(installContentMetaBuffer.GetSize() + patchMetaExtendedHeader->extended_data_size);
+            const size_t installTailOffset = installContentMetaBuffer.GetSize();
+            installContentMetaBuffer.Resize(installTailOffset + packagedTailSize);
+            memcpy(installContentMetaBuffer.GetData() + installTailOffset, m_bytes.GetData() + packagedTailOffset, packagedTailSize);
         }
     }
 }
-

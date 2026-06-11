@@ -23,10 +23,12 @@ SOFTWARE.
 #include "nx/nca_writer.h"
 #include "util/error.hpp"
 #include <zstd.h>
+#include <exception>
 #include <string.h>
 #include <memory>
 #include "util/crypto.hpp"
 #include "util/config.hpp"
+#include "util/nczblock.hpp"
 #include "util/title_util.hpp"
 #include "install/nca.hpp"
 #include <limits>
@@ -411,7 +413,12 @@ class NczBlockStreamWriter : public CloseableWriter
 {
 public:
      NczBlockStreamWriter(const std::function<WriterFn>& writeFn)
-          : m_writeFn(writeFn),
+          : m_outputWriteFn(writeFn),
+            m_writeFn([this](const u8* data, u64 size)
+            {
+                 m_totalDecompressedWritten += size;
+                 m_outputWriteFn(data, size);
+            }),
             m_headerParsed(false), m_blockSizesParsed(false),
             m_currentBlockIdx(0), m_currentBlockReadOffset(0)
      {
@@ -421,20 +428,61 @@ public:
 
      ~NczBlockStreamWriter() override
      {
-          NczBlockStreamWriter::close();
+          try
+          {
+               NczBlockStreamWriter::close();
+          }
+          catch (const std::exception& e)
+          {
+               LOG_DEBUG("[NczBlockStreamWriter] close failed in destructor: %s", e.what());
+          }
+          catch (...)
+          {
+               LOG_DEBUG("[NczBlockStreamWriter] close failed in destructor with unknown exception");
+          }
      }
 
      void close() override
      {
           if (isClosed()) return; // Idempotent close
 
-          // Free resources
           if (m_currentBlockWriter)
           {
+               if (m_currentBlockReadOffset != m_currentBlockCompressedSize)
+               {
+                    THROW_FORMAT("NczBlockStreamWriter: current block ended early (%llu/%llu bytes)",
+                         static_cast<unsigned long long>(m_currentBlockReadOffset),
+                         static_cast<unsigned long long>(m_currentBlockCompressedSize));
+               }
+
                m_currentBlockWriter->close(); // Flush remaining data to writerFn
                m_currentBlockWriter = NULL;
+               m_currentBlockIdx++;
+               m_currentBlockCompressedSize = 0;
+               m_currentBlockPrefix.clear();
           }
+
+          tin::nczblock::StreamValidationState state;
+          state.headerParsed = m_headerParsed;
+          state.blockSizesParsed = m_blockSizesParsed;
+          state.blockCount = m_headerParsed ? m_header.numberOfBlocks : 0;
+          state.currentBlockIndex = static_cast<std::uint32_t>(m_currentBlockIdx);
+          state.currentBlockOpen = false;
+          state.currentBlockReadOffset = m_currentBlockReadOffset;
+          state.currentBlockCompressedSize = m_currentBlockCompressedSize;
+          state.totalDecompressedWritten = m_totalDecompressedWritten;
+          state.expectedDecompressedSize = m_headerParsed ? m_header.decompressedSize : 0;
+
+          std::string error;
+          if (!tin::nczblock::ValidateStreamCompletion(state, error))
+          {
+               THROW_FORMAT("NczBlockStreamWriter: %s", error.c_str());
+          }
+
+          // Free resources
+          m_currentBlockPrefix.clear();
           m_writeFn = NULL;
+          m_outputWriteFn = NULL;
 
           CloseableWriter::close(); // Mark as closed after all cleanups are done
      }
@@ -519,48 +567,84 @@ public:
           while (sz)
           {
                // Starting a new block?
-               if (!m_currentBlockWriter)
+               if (m_currentBlockCompressedSize == 0)
                {
                     // Out of blocks?
                     if (m_currentBlockIdx >= m_header.numberOfBlocks)
                     {
-                         return;
+                         THROW_FORMAT("NczBlockStreamWriter: received unexpected trailing block data");
                     }
 
                     m_currentBlockReadOffset = 0;
+                    m_currentBlockCompressedSize = m_blockSizes[m_currentBlockIdx];
+                    m_currentBlockPrefix.clear();
+               }
 
-                    const u64 compressedSize = m_blockSizes[m_currentBlockIdx];
+               u64 expectedDecompSize = m_header.blockSize();
+               // If last block, adjust expected decompressed to remaining
+               if (m_currentBlockIdx == m_header.numberOfBlocks - 1)
+               {
+                    const u64 remainder = m_header.decompressedSize % m_header.blockSize();
+                    if (remainder > 0) expectedDecompSize = remainder;
+               }
 
-                    u64 expectedDecompSize = m_header.blockSize();
-                    // If last block, adjust expected decompressed to remaining
-                    if (m_currentBlockIdx == m_header.numberOfBlocks - 1)
+               if (!m_currentBlockWriter)
+               {
+                    const u64 blockSize = m_currentBlockCompressedSize;
+                    const u64 remainingBeforeDecision = std::min<u64>(sz, blockSize - m_currentBlockReadOffset);
+                    const u64 prefixNeed = (m_currentBlockPrefix.size() < tin::nczblock::kZstdMagicSize)
+                         ? std::min<u64>(remainingBeforeDecision, tin::nczblock::kZstdMagicSize - m_currentBlockPrefix.size())
+                         : 0;
+
+                    if (prefixNeed > 0)
                     {
-                         const u64 remainder = m_header.decompressedSize % m_header.blockSize();
-                         if (remainder > 0) expectedDecompSize = remainder;
-                         // TODO Log if expected < compressed ?
+                         append(m_currentBlockPrefix, ptr, prefixNeed);
+                         ptr += prefixNeed;
+                         sz -= prefixNeed;
+                         m_currentBlockReadOffset += prefixNeed;
                     }
 
-                    if (m_header.usesZstd())
+                    const auto mode = tin::nczblock::DecideBlockDecodeMode(
+                         m_header.type,
+                         m_currentBlockCompressedSize,
+                         expectedDecompSize,
+                         m_currentBlockPrefix,
+                         m_currentBlockReadOffset >= m_currentBlockCompressedSize);
+
+                    switch (mode)
                     {
-                         // Even when zstd flagged, if no compression achieved, assume uncompressed
-                         if (compressedSize < expectedDecompSize)
-                         {
+                         case tin::nczblock::BlockDecodeMode::NeedMoreData:
+                              continue;
+                         case tin::nczblock::BlockDecodeMode::Zstd:
                               m_currentBlockWriter = std::make_unique<ZstdStreamWriter>(m_writeFn);
-                         }
-                         else
-                         {
-                              LOG_DEBUG("[NczBlockStreamWriter] Block (%d) appears to have no compression - Using Direct Writer", m_currentBlockIdx);
+                              break;
+                         case tin::nczblock::BlockDecodeMode::Direct:
+                              LOG_DEBUG("[NczBlockStreamWriter] Block (%d) uses direct copy", m_currentBlockIdx);
                               m_currentBlockWriter = std::make_unique<DirectStreamWriter>(m_writeFn);
-                         }
+                              break;
+                         case tin::nczblock::BlockDecodeMode::Invalid:
+                              THROW_FORMAT("NczBlockStreamWriter: invalid block encoding at block %llu (mode=%s)",
+                                   static_cast<unsigned long long>(m_currentBlockIdx),
+                                   tin::nczblock::DescribeBlockDecodeMode(mode));
                     }
-                    else
+
+                    if (!m_currentBlockPrefix.empty())
                     {
-                         LOG_DEBUG("[NczBlockStreamWriter] Block (%d) has Unknown type (%d) - Using Direct Writer", m_currentBlockIdx, m_header.type);
-                         m_currentBlockWriter = std::make_unique<DirectStreamWriter>(m_writeFn);
+                         m_currentBlockWriter->write(m_currentBlockPrefix.data(), m_currentBlockPrefix.size());
+                         m_currentBlockPrefix.clear();
+                    }
+
+                    if (m_currentBlockReadOffset >= m_currentBlockCompressedSize)
+                    {
+                         m_currentBlockWriter->close();
+                         m_currentBlockWriter = NULL;
+                         m_currentBlockIdx++;
+                         m_currentBlockCompressedSize = 0;
+                         continue;
                     }
                }
 
-               const u64 blockSize = m_blockSizes[m_currentBlockIdx];
+               const u64 blockSize = m_currentBlockCompressedSize;
                const u64 remaining = std::min(sz, blockSize - m_currentBlockReadOffset);
 
                m_currentBlockWriter->write(ptr, remaining);
@@ -573,11 +657,14 @@ public:
                     m_currentBlockWriter->close();
                     m_currentBlockWriter = NULL;
                     m_currentBlockIdx++;
+                    m_currentBlockCompressedSize = 0;
+                    m_currentBlockPrefix.clear();
                }
           }
      }
 
 private:
+     std::function<WriterFn> m_outputWriteFn;
      std::function<WriterFn> m_writeFn;
 
      NczBlockHeader m_header;
@@ -587,7 +674,10 @@ private:
 
      u64 m_currentBlockIdx;
      u64 m_currentBlockReadOffset;
+     u64 m_currentBlockCompressedSize = 0;
+     u64 m_totalDecompressedWritten = 0;
      std::unique_ptr<CloseableWriter> m_currentBlockWriter;
+     std::vector<u8> m_currentBlockPrefix;
 
      std::vector<u8> m_buffer; // For header + block-sizes parsing phases
 };

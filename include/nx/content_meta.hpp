@@ -22,7 +22,7 @@ SOFTWARE.
 
 #pragma once
 
-#include <switch/services/ncm.h>
+#include <switch/services/ncm_types.h>
 #include <switch/types.h>
 #include <vector>
 
@@ -66,7 +66,7 @@ namespace nx::ncm
 
             PackagedContentMetaHeader GetPackagedContentMetaHeader();
             NcmContentMetaKey GetContentMetaKey();
-            std::vector<NcmContentInfo> GetContentInfos();
+            std::vector<NcmContentInfo> GetContentInfos(bool includeDeltaFragments = false);
 
             void GetInstallContentMeta(tin::data::ByteBuffer& installContentMetaBuffer, NcmContentInfo& cnmtContentInfo, bool ignoreReqFirmVersion);
     };

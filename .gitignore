@@ -18,3 +18,5 @@ scripts
 *.sh
 *.bat
 *.a
+.codex
+tests/test_nczblock
